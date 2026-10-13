@@ -1,0 +1,2 @@
+# Keep the delivered Windows source bytes unchanged on checkout.
+* -text

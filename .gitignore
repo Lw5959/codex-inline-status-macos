@@ -1,0 +1,30 @@
+# Local Python/Node environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+.pytest_cache/
+.cache/
+
+# Credentials and personal Codex state
+.env
+.env.*
+auth.json
+credentials*.json
+secrets*.json
+config.toml
+.codex/
+
+# Local runtime outputs and release verification artifacts
+logs/
+*.log
+*.tmp
+runtime.json
+health.json
+*-health.json
+*-validation.json
+VALIDATION*.json
+SHA256SUMS*
+IMPLEMENTATION.md
+*.zip
