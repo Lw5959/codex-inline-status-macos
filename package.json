@@ -1,0 +1,21 @@
+{
+  "name": "codex-inline-status-macos",
+  "version": "2.1.4",
+  "private": true,
+  "description": "Development tools for the native macOS Codex inline-status launcher",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs tests/test-visible-tokenizer.mjs tests/test-visible-coordinator.mjs",
+    "benchmark": "node scripts/benchmark_statusbar.mjs",
+    "build:tokenizer": "esbuild development/visible_tokenizer_entry.mjs --bundle --platform=node --format=esm --outfile=src/visible_tokenizer.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.11",
+    "js-tiktoken": "1.0.21",
+    "jsdom": "26.1.0",
+    "ws": "8.22.0"
+  }
+}

@@ -1,59 +1,70 @@
-# Codex 内嵌状态条（非官方）1.3.5
+# Codex Inline Status for macOS
 
-本项目是非官方本地增强工具，与 OpenAI 无隶属关系，也不是官方 Codex 组件。运行环境为 Windows、Node.js 22+ 和 Python 3.11+。通过启动器加载状态条，保留官方 App 及其登录设置。
+GPT 启动助手：为官方 Codex 桌面应用添加输入区状态条、可见文本速度和缓存命中率，通过共用本机通道检测 GPT 出口时区。
 
-这份包包含状态条、可见文本流式计量器、离线 tokenizer、Python 后端、TokenPulse 源码和启动脚本。适用于当前 Windows 用户的官方 Codex App；官方账号登录或 API 登录均沿用 App 自己的设置。安装器不读取或修改凭据，不替换官方 App 文件。
+这是基于 [wenalang05-arch/codex-inline-status](https://github.com/wenalang05-arch/codex-inline-status) v1.3.5 的非官方 macOS 适配，与 OpenAI 无隶属关系，不分发或修改官方应用。保留上游历史、MIT 许可和 Windows 入口。
 
-## 安装与重新接入
+## 下载与使用
 
-1. 保留整个源码包目录，不要单独移动脚本。先安装 **Node.js 22 或更高版本、Python 3.11 或更高版本**，并使命令可发现。脚本不会下载运行时或第三方包，也不安装 PySide GUI。
-2. 双击 `安装或更新.cmd`。默认安装至 `%LOCALAPPDATA%\Programs\CodexInlineStatus`。若已有可用的私有 Python 环境，会复用它；否则用本机 Python 创建不含 pip 的私有 venv。
-3. 双击 `启动状态条.vbs`。它定位当前用户最新的 `OpenAI.Codex` 包：App 未运行时通过 Windows 正式激活接口打开，并启用只监听 `127.0.0.1` 的 CDP；App 已带 CDP 运行时直接接入。
-4. App 已运行但没有 CDP 时，脚本会保留现状。请自行正常退出 App，再通过本包启动器打开。它不会关闭、杀死或重启 App。
+适用于 **Apple Silicon Mac、macOS 14+**，需要已安装并登录官方 Codex 桌面应用。原生 App 仅依赖系统框架，**不内嵌、不调用 Node 或 Python**。
 
-官方 App 升级后，可再次运行启动器。需要恢复状态条自身源码时，再运行安装或更新。包按名称查找当前 App 包，不固定官方版本路径；不过官方更新若改变页面结构或事件协议，状态条仍可能需要适配，不能保证永久兼容。
+1. 从 [Releases](https://github.com/Lw5959/codex-inline-status-macos/releases/latest) 下载 `GPT-Launcher-2.1.4-macos-arm64.dmg`。
+2. 打开 DMG，将 `GPT Launcher.app` 拖入 Applications，再打开「GPT 启动助手」。
+3. 检测 GPT 出口。国家代码为美国 `US` 且对应时区属于美国时才允许启动或连接；未知、失败和非美国结果均拦截。
+4. 首次使用时，正常退出官方应用后通过助手启动。已经通过助手启动的窗口升级后可点「连接现有窗口」，核验通过后直接接入。
 
-## 只读检查和可选参数
+助手从菜单栏打开，不需要另固定到 Dock。不会自动退出当前任务，不修改系统时区、系统代理、官方应用或登录配置。发行包使用本地 ad-hoc 签名，尚未 Apple 公证。
 
-在源码包目录打开 PowerShell：
+详细操作见 [App 使用说明](docs/app-usage.md)，网络口径和限制见 [原生版说明](docs/desktop-app.md)。
 
-```powershell
-.\Install-Status.ps1 -CheckOnly
-.\Launch-Codex.ps1 -CheckOnly
-.\Install-Status.ps1 -NoStart
+## 功能和统计口径
+
+- **5 秒刷新**：生成中显示最近采样区间的可见正文 tok/s；暂停、思考和工具执行期间保留最近一次有效读数。无有效样本显示「—」，有效低速显示 `<1 tok/s`。
+- **会话恢复**：切换回来立即恢复该会话的速度和缓存命中率。已确认摘要按 UUID 落盘，展示快照单独保存；悬浮说明标明历史来源，不继承其他窗口的采样时钟。
+- **数字动效**：速度与缓存数字采用约 700ms 上下模糊切换，横线和数字双向过渡，位数变化时宽度平滑变化，遵守系统减少动态效果设置。
+- **原生运行**：AppKit 界面，Swift 后台，系统 JavaScriptCore 分词，SQLite 只读获取本机对话的缓存统计。
+- **出口校验**：真实 GPT 连接与检测共用本工具的本机 CONNECT 通道；按 GPT 同域回显的明确 IP 查询时区，不读取 Clash 等代理软件配置，不解密 TLS。
+
+速度使用 `o200k_base` 对可见正文分词，扣除首批已经到达的文本；不包含隐藏推理、工具执行或首字等待。它是客户端观测值，不等于服务器解码速度或账单 token。缓存命中率为累计缓存输入 token / 累计输入 token。
+
+CDP 只允许本机连接。保存的统计和展示快照不含聊天正文或认证信息；未知归属、冲突或失效样本会排除。动态出口池中另一条连接的探测结果，不能证明某一条后续模型请求的实际源 IP。
+
+## 工程结构
+
+```text
+.
+├── macos/
+│   ├── AppMain.swift       # 原生菜单栏 App 入口
+│   ├── native/             # 通道、监视器、统计、持久化与服务
+│   ├── tools/              # 图标构建工具
+│   └── legacy/             # 历史 Python/Node 实现，仅供兼容和对照
+├── src/                    # 状态条、观察器、计量器、离线 tokenizer 与 Windows 后端
+├── scripts/                # App、DMG 构建和性能基准
+├── tests/                  # 单元、布局、恢复与原生链路夹具
+├── development/            # tokenizer 的可编辑构建入口
+├── TokenPulse/             # 保留许可的上游 Python 源码快照
+├── docs/                   # 使用、开发和历史兼容说明
+├── .github/workflows/      # macOS 构建与回归检查
+├── package.json            # 仅用于开发的 Node 依赖和命令
+├── package-lock.json
+└── Makefile                # 统一构建、测试和打包入口
 ```
 
-`-CheckOnly` 只报告源文件、运行环境和现有本机 CDP 状态，不复制文件、不创建 venv、不启动后台或 App。`-NoStart` 安装源码但不接入已运行 App。两个脚本均支持 `-InstallRoot 'D:\Tools\CodexInlineStatus'` 和 `-Port 9335`；自定义安装目录时请在 PowerShell 运行安装目录内的 `Launch-Codex.ps1 -InstallRoot ...`，默认 VBS 启动器只查默认目录。
+`build/`、`release/`、`outputs/`、依赖缓存和本地诊断记录均不进入源码仓库。DMG 和 ZIP 通过 GitHub Releases 分发。根目录的 PowerShell、CMD 和 VBS 文件继续作为 Windows 兼容入口，见 [Windows 说明](docs/windows.md)。
 
-安装器只覆盖 `src/` 中列出的 9 个运行文件、`TokenPulse/src/`、自身启动脚本/说明和随包许可证。旧文件先备份到安装目录的 `backups/<时间>-<随机后缀>/`；不会清空目录、删除旧环境或修改用户 auth/config。无可用 Python、Node 或源码验证失败时会停止。若旧 venv 损坏会保留它，并要求修复或指定新的安装目录。
+## 本地开发
 
-## 数据含义
+构建 App 需要 Apple Silicon Mac、Xcode Command Line Tools 和 Python 3.11+。运行测试、基准或重建 tokenizer 另需 Node.js 22+；这些是开发工具，均不进入发行包。
 
-- 可见流式速度使用实际收到的 `agentMessage` 文本，以 `o200k_base` 对全文分词。只计首批文本 UTF-8 边界之后的 token，时间取首个到最后一个非空文本 delta 的实际间隔。
-- 不把后端总输出 token 或隐藏推理用量除以可见文本的短时间。它表示本机观测到的可见文本吞吐，不是服务端纯解码速度，也不是 DSH 的 provider usage 原口径。
-- 观测器只在当前窗口活动对话采集，不补历史；无合格样本时不显示虚构速度。累计范围是当前观测器下最近 128 条合格观测记录。
+```sh
+npm ci --ignore-scripts
+make build
+make test
+make dmg
+```
 
-## 源码结构与检查
+也可用 `make verify` 按顺序执行构建、测试和 DMG 校验。打包脚本拒绝覆盖同名 DMG，重新打包前需先处理旧产物。开发方法和检查边界见 [构建与验证](docs/macos.md)。
 
-`src/` 有 9 个运行文件：`native_statusbar.js`、`native_status_injector.mjs`、`native_status_backend.py`、`codex_status_backend.py`、`turn_elapsed_meter.py`、`start-inline-status.ps1`、`visible_stream_observer.js`、`visible_stream_meter.mjs`、`visible_tokenizer.mjs`。`TokenPulse/src/token_pulse/` 保留 Python 源码；`tests/` 保留离线验证源码，安装器不会把测试复制到运行目录。
+## 许可与来源
 
-状态条后台的状态、启动错误和运行记录位于系统“文档”目录下的 `ChatGPT-Tools\inline-status-state`。这些是本工具自己的运行文件；诊断故障时先运行 `Launch-Codex.ps1 -CheckOnly`，再检查该目录。状态条未接入不等于官方 App 无法使用。
-
-
-## 开发与重新构建
-
-当前版本按用户确认，将状态条放在输入框整体几何中心左侧 16 CSS 像素处，作视觉平衡微调；左右实际按钮边界仅用于限制两侧对称的可用宽度，防止遮挡。定位不改为左右按钮空白区域的中心。保留各窗口独立统计和切换时后台刷新。
-本包没有账号、API Key、认证文件或真实会话日志。Node tokenizer 已随源码提供，正常安装无需联网下载库。
-开发时先在 tests/native-statusbar-deps 运行 npm ci；然后在包根目录运行 node --test tests/*.test.mjs tests/test-visible-tokenizer.mjs。
-重新生成 tokenizer：
-
-    node tests/native-statusbar-deps/node_modules/esbuild/bin/esbuild development/visible_tokenizer_entry.mjs --bundle --platform=node --format=esm --outfile=src/visible_tokenizer.mjs
-
-每个窗口只统计自己当前绑定的对话；即使两个窗口显示同一对话，也不混用观测时钟或样本。状态条由启动器加载，并不会替换官方 App 文件。
-
-仓库只包含源码、开发依赖锁文件及许可证，不包含个人接续文档、账户凭据、会话日志、虚拟环境或运行报告。官方更新改变页面结构或事件协议后，可能需要重新适配。
-
-
-## 许可
-
-项目新增代码按根目录 `LICENSE` 的 MIT 条款提供。第三方代码保留各自版权与许可：`TokenPulse/LICENSE`、`TokenPulse/THIRD_PARTY.md`、`src/DSH-MIT-LICENSE.txt`、`src/JS-TIKTOKEN-LICENSE.txt` 和 `src/BASE64-JS-LICENSE.txt`。离线 tokenizer 的第三方许可不因打包而改变。
+新增代码采用 [MIT](LICENSE)。上游来源、第三方许可证和 tokenizer 依赖见 [NOTICE](NOTICE.md)。原始 TokenPulse 的 [许可](TokenPulse/LICENSE)及[第三方声明](TokenPulse/THIRD_PARTY.md)随源码保留。

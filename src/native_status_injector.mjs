@@ -16,6 +16,9 @@ const remove = args.includes('--remove');
 const reportPath = option('--report', null);
 const runId = option('--run-id', `manual-${process.pid}`);
 const screenshotPath = option('--screenshot', null);
+// macOS 私有环境使用 bin/python3；Windows 保留原有路径，也允许启动器明确指定解释器。
+const python = option('--python', path.join(root, 'TokenPulse', '.venv',
+  ...(process.platform === 'win32' ? ['Scripts', 'python.exe'] : ['bin', 'python3'])));
 const script = await fs.readFile(path.join(root, 'native_statusbar.js'), 'utf8');
 const streamScript = await fs.readFile(path.join(root, 'visible_stream_observer.js'), 'utf8');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -29,7 +32,7 @@ class Cdp {
   }
   async open() {
     const endpoint = new URL(this.target.webSocketDebuggerUrl);
-    if (endpoint.protocol !== 'ws:' || !['127.0.0.1', 'localhost', '[::1]'].includes(endpoint.hostname) || Number(endpoint.port) !== port) throw new Error('CDP endpoint must remain local');
+    if (endpoint.protocol !== 'ws:' || !['127.0.0.1', 'localhost', '[::1]'].includes(endpoint.hostname) || Number(endpoint.port) !== port || endpoint.username || endpoint.password) throw new Error('CDP endpoint must remain local');
     this.socket = new WebSocket(endpoint.href);
     try {
     await new Promise((resolve, reject) => {
@@ -82,7 +85,11 @@ class Metrics {
   start() {
     if (this.closing || this.starts >= 4 || Date.now() < this.nextStart) return;
     this.starts++; this.dead = false;
-    const child = spawn(path.join(root, 'TokenPulse', '.venv', 'Scripts', 'python.exe'), [path.join(root, 'native_status_backend.py')], { cwd: root, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+    const child = spawn(python, [path.join(root, 'native_status_backend.py')], {
+      cwd: root, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true,
+      // 直接使用随包源码，不安装 TokenPulse GUI 或联网下载 Python 依赖。
+      env: { ...process.env, PYTHONPATH: [path.join(root, 'TokenPulse', 'src'), process.env.PYTHONPATH].filter(Boolean).join(path.delimiter) },
+    });
     this.child = child;
     const failed = () => {
       if (this.child !== child || this.closing) return;
@@ -187,7 +194,7 @@ try {
     let targets = [];
     let discoveryOk = false;
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(2000) });
+      const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(2000), redirect: 'error' });
       targets = (await response.json()).filter(isTarget);
       discoveryOk = true;
     } catch { }
@@ -210,8 +217,11 @@ try {
         let session = sessions.get(target.id);
         if (!session) { session = await new Cdp(target).open(); sessions.set(target.id, session); }
         if (remove) { await session.evaluate('window.__CODEX_VISIBLE_STREAM__?.destroy(); window.__CODEX_INLINE_STATUS__?.destroy()'); verification.push({ removed: true }); continue; }
-        await session.evaluate(streamScript);
-        await session.evaluate(script);
+        // 仅首次接入或页面重载后注入；持续发送整份脚本会重复解析并制造短期对象。
+        // 每轮检查页面自身标识，避免同一 target 导航后漏装观察器或沿用旧计时。
+        const runtime = await session.evaluate('({ stream: window.__CODEX_VISIBLE_STREAM__?.version === "1.2.0", bar: window.__CODEX_INLINE_STATUS__?.revision === "1.3.5-live.7" })');
+        if (!runtime?.stream) await session.evaluate(streamScript);
+        if (!runtime?.bar) await session.evaluate(script);
         const views = await session.evaluate('window.__CODEX_INLINE_STATUS__.discover()');
         for (const view of Array.isArray(views) ? views : []) {
           if (!uuid.test(view.threadId || '') || typeof view.key !== 'string') continue;
@@ -220,13 +230,13 @@ try {
           const stream = session.visibleMeter.update(view.threadId, snapshot);
           const cached = cache.get(view.threadId);
           const combined = {
-            ...cached, ...stream, issue: null, cache_issue: cached?.issue || null,
+            ...cached, ...stream, issue: stream.issue || null, cache_issue: cached?.issue || null,
             scope: 'visible_text_client', measurement_method: 'visible_stream', observation_id: snapshot.observerId,
             measured_tokens: stream.tokens, measured_seconds: stream.seconds,
           };
           await session.evaluate(`window.__CODEX_INLINE_STATUS__.apply(${JSON.stringify({ key: view.key, metrics: combined })})`);
         }
-        verification.push(await session.evaluate('window.__CODEX_INLINE_STATUS__.inspect()'));
+        verification.push(await session.evaluate('window.__CODEX_INLINE_STATUS__.inspect({ refresh: false })'));
         if (screenshotPath && !savedScreenshot && views?.length) {
           const shot = await session.call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
           await fs.writeFile(screenshotPath, Buffer.from(shot.data, 'base64')); savedScreenshot = true;
@@ -249,3 +259,6 @@ try {
   else await destroyAll();
   await writeHealth({ ...health, running: false, cleanupUnconfirmed, status: once || remove ? health.status : cleanupUnconfirmed ? 'stopped-cleanup-unconfirmed' : 'stopped' });
 }
+// 信号处理器接管了默认退出行为；清理与报告落盘后明确结束进程，避免调试
+// 连接或 HTTP 保活句柄让已停止的后台长期驻留，并阻塞后续更新。
+if (stopping) process.exit(process.exitCode || 0);

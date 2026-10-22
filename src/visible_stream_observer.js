@@ -2,7 +2,7 @@
 (() => {
   "use strict";
   const NAME = "__CODEX_VISIBLE_STREAM__";
-  const VERSION = "1.0.1";
+  const VERSION = "1.2.0";
   if (window[NAME]?.version === VERSION) return;
   window[NAME]?.destroy?.();
 
@@ -15,8 +15,23 @@
   const MAX_SNAPSHOT_CHARS = 512 * 1024;
   const records = new Map();
   const threads = new Map();
+  const activities = new Map();
   let revision = 0;
   let active = true;
+  let notifyTimer = null;
+
+  // CDP 只接收无正文的变更信号；密集 delta 合并为 5 秒一次，避免频繁唤醒后台。
+  function notify(urgent = false) {
+    if (typeof window.__codexInlineNotify !== "function") return;
+    if (notifyTimer !== null) {
+      if (!urgent) return;
+      clearTimeout(notifyTimer);
+    }
+    notifyTimer = setTimeout(() => {
+      notifyTimer = null;
+      if (active) { try { window.__codexInlineNotify("stream"); } catch {} }
+    }, urgent ? 0 : 5000);
+  }
 
   function forget(key) {
     const record = records.get(key);
@@ -60,6 +75,7 @@
       item.revision = ++revision;
       characters -= size;
     }
+    notify(record.closed || record.state === "invalid");
   }
 
   function startedAt(params, item) {
@@ -87,24 +103,37 @@
     } catch { return new Set(); }
   }
 
+  // 只保存阶段和归属，不读取推理或工具正文。新一轮开始后不能把上一轮速度继续当成实时值。
+  function activity(threadId, turnId, phase, itemId = null) {
+    const previous = activities.get(threadId);
+    if (previous?.turnId === turnId && previous.phase === phase && previous.itemId === itemId) return;
+    activities.delete(threadId);
+    activities.set(threadId, { turnId, phase, itemId });
+    while (activities.size > 32) activities.delete(activities.keys().next().value);
+    revision++;
+    notify();
+  }
+
   function onMessage(event) {
     if (!active || (event.source !== null && event.source !== window)) return;
     const data = event.data;
     if (!data || data.type !== "mcp-notification" || data.hostId !== "local") return;
     const params = data.params;
-    if (!params || typeof params.threadId !== "string" || typeof params.turnId !== "string"
-      || !UUID.test(params.threadId) || !UUID.test(params.turnId)) return;
+    const eventTurnId = params?.turnId ?? params?.turn?.id;
+    if (!params || typeof params.threadId !== "string" || typeof eventTurnId !== "string"
+      || !UUID.test(params.threadId) || !UUID.test(eventTurnId)) return;
     const start = data.method === "item/started";
     const complete = data.method === "item/completed";
     const delta = data.method === "item/agentMessage/delta";
-    if (!start && !complete && !delta) return;
-    if ((start || complete) && params.item?.type !== "agentMessage") return;
+    const turnStart = data.method === "turn/started";
+    const turnComplete = data.method === "turn/completed";
+    if (!start && !complete && !delta && !turnStart && !turnComplete) return;
     if (delta && (typeof params.delta !== "string" || params.delta.length === 0)) return;
-    const itemId = start || complete ? params.item.id : params.itemId;
-    if (typeof itemId !== "string" || !itemId.length || itemId.length > 160) return;
+    const itemId = start || complete ? params.item?.id : params.itemId;
+    if (!turnStart && !turnComplete && (typeof itemId !== "string" || !itemId.length || itemId.length > 160)) return;
 
     const threadId = params.threadId.toLowerCase();
-    const turnId = params.turnId.toLowerCase();
+    const turnId = eventTurnId.toLowerCase();
     const key = JSON.stringify([threadId, turnId, itemId]);
     const now = performance.now();
     const visibleThreads = activeThreads();
@@ -118,6 +147,23 @@
     let record = records.get(key);
     if (!visibleThreads.has(threadId)) {
       if (record && record.state !== "invalid") { invalidate(record, "thread_not_active"); retain(record); }
+      return;
+    }
+    if (turnStart || turnComplete) {
+      // 延迟到达的旧轮完成通知不能覆盖当前轮的输出阶段。
+      if (!turnComplete || !activities.has(threadId) || activities.get(threadId).turnId === turnId) {
+        activity(threadId, turnId, turnComplete ? "idle" : "waiting");
+      }
+      return;
+    }
+    if ((start || complete) && params.item?.type !== "agentMessage") {
+      const type = params.item?.type;
+      const phase = type === "reasoning" ? "thinking"
+        : ["commandExecution", "mcpToolCall", "dynamicToolCall", "webSearch", "fileChange"].includes(type) ? "tool" : null;
+      if (phase && start) activity(threadId, turnId, phase, itemId);
+      else if (phase && activities.get(threadId)?.turnId === turnId && activities.get(threadId)?.itemId === itemId) {
+        activity(threadId, turnId, "waiting");
+      }
       return;
     }
     if (record?.state === "invalid") return;
@@ -143,6 +189,7 @@
       else {
         record.startTimeMs = now;
         record.serverStartedAtMs = serverStart;
+        activity(threadId, turnId, "waiting", itemId);
       }
     } else if (record.startTimeMs === null) {
       invalidate(record, "missing_start");
@@ -158,6 +205,7 @@
         }
         record.lastDeltaMs = now;
         record.state = record.deltaCount >= 2 && elapsed(record) > 0 ? "provisional" : "collecting";
+        activity(threadId, turnId, "output", itemId);
       }
     } else {
       const finalText = params.item.text;
@@ -174,6 +222,7 @@
         record.closed = true;
         record.serverCompletedAtMs = completedAt;
         record.state = "completed";
+        if (activities.get(threadId)?.turnId === turnId && activities.get(threadId)?.itemId === itemId) activity(threadId, turnId, "waiting");
       }
     }
     record.lastEventMs = now;
@@ -182,18 +231,34 @@
 
   const api = Object.freeze({
     version: VERSION,
-    snapshot(threadId) {
+    observerId,
+    snapshot(threadId, cursor) {
       const thread = typeof threadId === "string" && UUID.test(threadId) ? threads.get(threadId.toLowerCase()) : null;
-      return { observerId, revision, items: thread ? [...thread.values()].slice(-128).map(record => ({
+      // 游标只在同一观察器内有效；重载或断点丢失时完整重同步，不沿用旧窗口的数据。
+      const delta = cursor?.observerId === observerId && Number.isSafeInteger(cursor.revision)
+        && cursor.revision >= 0 && cursor.revision <= revision;
+      const items = thread ? [...thread.values()].slice(-128) : [];
+      const now = performance.now();
+      return { observerId, revision, sampledAtMs: now, delta,
+        activity: activities.get(threadId?.toLowerCase()) ?? null,
+        baseRevision: delta ? cursor.revision : null,
+        present: items.map(record => [record.turnId, record.itemId]),
+        // 未出现正文或暂停超过窗口时恢复空闲频率；新片段会通过事件立即唤醒监视器。
+        streaming: items.some(record => !record.closed && record.state !== "invalid"
+          && record.lastDeltaMs !== null && now - record.lastDeltaMs < 5000),
+        items: items.filter(record => !delta || record.revision > cursor.revision).map(record => ({
         itemId: record.itemId, turnId: record.turnId, text: record.text, firstText: record.firstText,
         durationMs: record.state === "invalid" ? 0 : elapsed(record), deltaCount: record.deltaCount,
+        firstDeltaMs: record.firstDeltaMs, lastDeltaMs: record.lastDeltaMs,
         state: record.state, issue: record.issue, revision: record.revision,
-      })) : [] };
+      })) };
     },
     destroy() {
       active = false;
+      if (notifyTimer !== null) clearTimeout(notifyTimer);
+      notifyTimer = null;
       window.removeEventListener("message", onMessage);
-      records.clear(); threads.clear(); revision++;
+      records.clear(); threads.clear(); activities.clear(); revision++;
       if (window[NAME] === api) delete window[NAME];
       return { removed: true };
     },

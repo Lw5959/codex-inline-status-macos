@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
-const require=createRequire(new URL('./native-statusbar-deps/package.json',import.meta.url));
+const require=createRequire(import.meta.url);
 const {JSDOM}=require('jsdom');
 const source=fs.readFileSync(process.env.STATUSBAR_SOURCE||new URL('../src/native_statusbar.js',import.meta.url),'utf8');
 const A='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -53,7 +53,7 @@ test('draft-to-real-thread transition preserves the same home host and measures 
   assert.equal(view.threadId,A);
   api.apply({key:view.key,metrics:{scope:'visible_text_client',measurement_method:'visible_stream',tps:123,cache_hit:.95}});
   assert.equal(doc.querySelector('[data-codex-inline-status]'),host);
-  assert.equal(api.inspect().bindings[0].labels[0],'≈123 tok/s');
+  assert.equal(api.inspect().bindings[0].labels[0],'123 tok/s');
 });
 test('rebuilding a home composer retains its outside-React host and cleanup restores row styles',t=>{
   const {doc,api}=setup(t,A);

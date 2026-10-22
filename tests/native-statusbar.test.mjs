@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 
-const require = createRequire(new URL("./native-statusbar-deps/package.json", import.meta.url));
+const require = createRequire(import.meta.url);
 const { JSDOM, VirtualConsole } = require("jsdom");
 const source = fs.readFileSync(process.env.STATUSBAR_SOURCE || new URL("../src/native_statusbar.js", import.meta.url), "utf8");
 const A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -21,14 +21,32 @@ test('visible stream scope displays its own speed and documents the counting con
   assert.equal(api.apply({ key, metrics: { scope:'visible_text_client', measurement_method:'visible_stream',
     tps:123, measured_samples:1, measured_tokens:246, measured_seconds:2, cache_hit:.95 } }), true);
   const state = api.inspect().bindings[0];
-  assert.deepEqual(Array.from(state.labels), ['≈123 tok/s', '缓存命中 95.0%']);
+  assert.deepEqual(Array.from(state.labels), ['123 tok/s', '缓存命中 95.0%']);
   const title = document.querySelector('[data-codex-inline-status]').shadowRoot.querySelector('[data-metric="speed"]').title;
   assert.match(title,/可见文本流式速度/); assert.match(title,/o200k_base/); assert.match(title,/不包含隐藏推理/);
   api.apply({key,metrics:{scope:'visible_text_client',measurement_method:'visible_stream',tps:123,cache_issue:'source_unavailable',cache_hit:.95}});
-  assert.deepEqual(Array.from(api.inspect().bindings[0].labels), ['≈123 tok/s', '缓存命中 —']);
+  assert.deepEqual(Array.from(api.inspect().bindings[0].labels), ['123 tok/s', '缓存命中 —']);
   api.apply({key,metrics:{scope:'visible_text_client',measurement_method:'stream_decode',tps:12047}});
   assert.equal(api.inspect().bindings[0].labels[0], '— tok/s');
   api.destroy(); dom.window.close();
+});
+
+test('identical metric updates preserve text nodes and avoid redundant DOM writes', () => {
+  const { dom, document, api } = setup(composer(A));
+  const key = api.discover()[0].key;
+  api.apply({ key, metrics: metrics(112) });
+  const shadow = document.querySelector('[data-codex-inline-status]').shadowRoot;
+  const label = shadow.querySelector('[data-metric="speed"] > span');
+  const originalText = label.firstChild;
+  const changes = new dom.window.MutationObserver(() => {});
+  changes.observe(shadow, { subtree: true, childList: true, attributes: true, characterData: true });
+  api.apply({ key, metrics: metrics(112) });
+  assert.equal(label.firstChild, originalText, '相同读数应保留文本节点，避免触发额外观察和重排');
+  assert.equal(changes.takeRecords().length, 0);
+  api.apply({ key, metrics: metrics(113) });
+  assert.equal(label.textContent, '113 tok/s');
+  assert.ok(changes.takeRecords().length > 0, '实际变化仍应更新可见数据');
+  changes.disconnect(); api.destroy(); dom.window.close();
 });
 
 test('cheap streaming identity lookup handles a pending route mutation synchronously', () => {
@@ -38,7 +56,156 @@ test('cheap streaming identity lookup handles a pending route mutation synchrono
   assert.deepEqual(Array.from(api.currentThreadIds()),[B]);
   api.destroy(); dom.window.close();
 });
+
+test('metric refreshes reuse bindings and skip global queries and geometry reads', () => {
+  const { dom, document, api } = setup(composer(A), false, { resizeObserver: true });
+  const key = api.bindings()[0].key;
+  let scans = 0, geometry = 0;
+  const originalGeometry = dom.window.HTMLElement.prototype.getBoundingClientRect;
+  const original = document.querySelectorAll.bind(document);
+  document.querySelectorAll = selector => { scans++; return original(selector); };
+  dom.window.HTMLElement.prototype.getBoundingClientRect = () => { geometry++; return {}; };
+  for (let i = 0; i < 50; i++) {
+    api.apply({ key, metrics: metrics(100 + i) });
+    api.inspect({ refresh: false, geometry: false });
+  }
+  assert.equal(scans, 0); assert.equal(geometry, 0);
+  // 没有及时交付的路由切换仍必须先被消费，不能为了性能接受旧绑定。
+  dom.window.HTMLElement.prototype.getBoundingClientRect = originalGeometry;
+  document.querySelector('[data-above-composer-conversation-id]').setAttribute('data-above-composer-conversation-id', B);
+  assert.equal(api.apply({ key, metrics: metrics(999) }), false);
+  assert.deepEqual(Array.from(api.currentThreadIds()), [B]);
+  api.destroy(); dom.window.close();
+});
+
+test('style-hidden pages cannot keep authorizing cached thread bindings', () => {
+  const { dom, document, api } = setup(composer(A));
+  const key = api.bindings()[0].key;
+  document.querySelector('section').style.display = 'none';
+  assert.deepEqual(Array.from(api.currentThreadIds()), []);
+  assert.equal(api.apply({ key, metrics: metrics(999) }), false);
+  document.querySelector('section').style.display = '';
+  assert.deepEqual(Array.from(api.currentThreadIds()), [A]);
+  api.destroy(); dom.window.close();
+});
+
+test('number changes blur only digits, preserve current labels and respect reduced motion', () => {
+  const { dom, document, api, timers } = setup(composer(A), true);
+  const key = api.bindings()[0].key;
+  api.apply({ key, metrics: metrics(100, .95) });
+  api.apply({ key, metrics: metrics(120, .96) });
+  const shadow = document.querySelector('[data-codex-inline-status]').shadowRoot;
+  const digits = shadow.querySelector('[data-metric="speed"] .number-switch');
+  assert.equal(digits.dataset.previous, '100'); assert.equal(digits.textContent, '120');
+  assert.ok(digits.classList.contains('is-switching'));
+  const cacheDigits = shadow.querySelector('[data-metric="cache"] .number-switch');
+  assert.equal(cacheDigits.dataset.previous, '95.0'); assert.equal(cacheDigits.textContent, '96.0');
+  assert.ok(cacheDigits.classList.contains('is-switching'), '缓存百分比也应播放相同的上下模糊切换');
+  assert.deepEqual(Array.from(api.inspect().bindings[0].labels), ['120 tok/s', '缓存命中 96.0%']);
+  assert.match(shadow.querySelector('style').textContent, /gap:3px/);
+  const animationCSS = shadow.querySelector('style').textContent;
+  for (const keyframes of animationCSS.matchAll(/@keyframes[^@]+/g)) assert.doesNotMatch(keyframes[0], /filter\s*:/, '模糊保持静态，动画只改变 transform/opacity');
+  for (const [id, timer] of [...timers]) if (timer.delay === 850) { timers.delete(id); timer.callback(); }
+  assert.equal(digits.dataset.previous, undefined); assert.equal(digits.classList.contains('is-switching'), false);
+  api.apply({ key, metrics: metrics(120, .96) });
+  assert.equal(digits.classList.contains('is-switching'), false, '相同数字不能重启动效');
+  dom.window.matchMedia = () => ({ matches: true });
+  api.apply({ key, metrics: metrics(130, .97) });
+  assert.equal(digits.textContent, '130'); assert.equal(digits.classList.contains('is-switching'), false);
+  api.destroy(); assert.equal(timers.size, 0); dom.window.close();
+});
+
+test('sub-unit speeds stay positive in the label instead of rounding down to zero', t => {
+  const { dom, api } = setup(composer(A));t.after(() => { api.destroy(); dom.window.close(); });
+  api.apply({ key: api.bindings()[0].key, metrics: metrics(.2) });
+  assert.equal(api.inspect({refresh:false,geometry:false}).bindings[0].labels[0], '<1 tok/s');
+});
+
+test('digit width follows asynchronous intrinsic sizes and releases observation on removal', t => {
+  const {dom,api,document,resizeObservers}=setup(composer(A),true,{resizeObserver:true});
+  t.after(()=>{api.destroy();dom.window.close()});
+  const key=api.bindings()[0].key;api.apply({key,metrics:metrics(100)});
+  const shadow=document.querySelector('[data-codex-inline-status]').shadowRoot;
+  const digits=shadow.querySelector('[data-metric="speed"] .number-switch');
+  const text=digits.querySelector('.number-text'),observer=resizeObservers[1];
+  text.getBoundingClientRect=()=>{throw Error('数字更新不能同步测量布局')};
+  assert.ok(observer.nodes.has(text));
+  observer.callback([{target:text,contentBoxSize:[{inlineSize:21}]}]);assert.equal(digits.style.width,'21px');
+  api.apply({key,metrics:metrics(99)});
+  assert.equal(digits.style.width,'21px','新文字不能先把旧宽度瞬间改掉');
+  observer.callback([{target:text,contentBoxSize:[{inlineSize:14}]}]);assert.equal(digits.style.width,'14px');
+  assert.match(shadow.querySelector('style').textContent,/transition:width 700ms/);
+  api.destroy();assert.equal(observer.nodes.size,0);assert.equal(observer.disconnected,true);
+});
+
+test('placeholder-to-number keeps its width container and animates both speed and cache', t => {
+  const {dom,api,document,resizeObservers}=setup(composer(A),true,{resizeObserver:true});
+  t.after(()=>{api.destroy();dom.window.close()});
+  const shadow=document.querySelector('[data-codex-inline-status]').shadowRoot;
+  const speed=shadow.querySelector('[data-metric="speed"] .number-switch');
+  const cache=shadow.querySelector('[data-metric="cache"] .number-switch');
+  const observer=resizeObservers[1];
+  for(const digits of [speed,cache])observer.callback([{target:digits.querySelector('.number-text'),contentBoxSize:[{inlineSize:7}]}]);
+  api.apply({key:api.bindings()[0].key,metrics:metrics(100,.95)});
+  for(const digits of [speed,cache]){
+    assert.equal(digits.dataset.previous,'—');assert.ok(digits.classList.contains('is-switching'));
+    assert.equal(digits.style.width,'7px','横线的实测宽度保留到新字宽异步交付');
+  }
+  assert.deepEqual(Array.from(api.inspect({refresh:false,geometry:false}).bindings[0].labels),['100 tok/s','缓存命中 95.0%']);
+});
+
+test('number-to-placeholder animates both metrics without retaining a previous conversation', t => {
+  const {dom,api,document,resizeObservers}=setup(composer(A),true,{resizeObserver:true});
+  t.after(()=>{api.destroy();dom.window.close()});
+  const key=api.bindings()[0].key;api.apply({key,metrics:metrics(100,.95)});
+  const shadow=document.querySelector('[data-codex-inline-status]').shadowRoot;
+  const digits=[...shadow.querySelectorAll('.number-switch')],observer=resizeObservers[1];
+  for(const value of digits)observer.callback([{target:value.querySelector('.number-text'),contentBoxSize:[{inlineSize:21}]}]);
+  api.apply({key,metrics:metrics(null,null)});
+  for(const [i,value] of digits.entries()){
+    assert.equal(value.textContent,'—');assert.equal(value.dataset.previous,i===0?'100':'95.0');
+    assert.ok(value.classList.contains('is-switching'));assert.equal(value.style.width,'21px');
+    observer.callback([{target:value.querySelector('.number-text'),contentBoxSize:[{inlineSize:7}]}]);
+    assert.equal(value.style.width,'7px');
+  }
+  api.apply({key,metrics:metrics(120,.96)});
+  document.querySelector('[data-above-composer-conversation-id]').setAttribute('data-above-composer-conversation-id',B);
+  api.bindings();
+  for(const value of digits){assert.equal(value.dataset.previous,undefined);assert.equal(value.classList.contains('is-switching'),false)}
+});
+
+test('restored conversation metrics identify their saved source and remain available during log catch-up', t => {
+  const {dom,api,document}=setup(composer(A));t.after(()=>{api.destroy();dom.window.close()});
+  const key=api.bindings()[0].key;
+  api.apply({key,metrics:{...metrics(120,.95),scope:'visible_text_client',measurement_method:'visible_stream',state:'saved',
+    speed_persisted:true,cache_persisted:true,speed_saved_at:1700000000,cache_saved_at:1700000000,cache_issue:'catching_up'}});
+  const state=api.inspect({refresh:false,geometry:false}).bindings[0];
+  assert.deepEqual(Array.from(state.labels),['120 tok/s','缓存命中 95.0%']);assert.equal(state.speedPersisted,true);assert.equal(state.cachePersisted,true);
+  const shadow=document.querySelector('[data-codex-inline-status]').shadowRoot;
+  assert.match(shadow.querySelector('[data-metric="speed"]').title,/上次保存.*已确认速度/);
+  assert.match(shadow.querySelector('[data-metric="cache"]').title,/上次保存的缓存命中率/);
+  api.apply({key,metrics:metrics(125,.96)});
+  assert.equal(api.inspect({refresh:false,geometry:false}).bindings[0].speedPersisted,false);
+});
 const rect = (left, top, width, height) => ({ x: left, y: top, left, top, right: left + width, bottom: top + height, width, height });
+
+test('speed always uses tok/s and phase text remains in the tooltip', t => {
+  const { dom, api } = setup(composer(A));
+  t.after(() => { api.destroy(); dom.window.close(); });
+  const key = api.bindings()[0].key;
+  for (const [phase, label] of [['thinking', '思考中'], ['tool', '工具执行中'], ['waiting', '等待正文']]) {
+    api.apply({ key, metrics: { ...metrics(112, .95), scope: 'visible_text_client',
+      measurement_method: 'visible_stream', state: 'waiting', phase, tps: null } });
+    const reading = api.inspect({ refresh: false, geometry: false }).bindings[0];
+    assert.equal(reading.labels[0], '— tok/s'); assert.equal(reading.labels[1], '缓存命中 95.0%');
+    assert.equal(reading.phase, phase); assert.equal(reading.state, 'waiting');
+    assert.ok(dom.window.document.querySelector('[data-codex-inline-status]').shadowRoot.querySelector('[data-metric="speed"]').title.includes(label));
+  }
+  api.apply({ key, metrics: { ...metrics(120, .96), scope: 'visible_text_client', measurement_method: 'visible_stream', state: 'provisional' } });
+  const shadow = dom.window.document.querySelector('[data-codex-inline-status]').shadowRoot;
+  assert.ok(shadow.querySelector('[data-metric="speed"] .number-switch').classList.contains('is-switching'), '等待后首次出现数字也默认播放动画');
+  assert.ok(shadow.querySelector('[data-metric="cache"] .number-switch').classList.contains('is-switching'));
+});
 function footerGeometry(node) {
   if (node.matches('[data-thread-scroll-footer]')) return rect(291, 400, 789, 150);
   if (node.matches('[data-codex-inline-status]')) return rect(291 + (parseFloat(node.style.left) || 0), 400 + (parseFloat(node.style.top) || 0), parseFloat(node.style.width) || 240, 26);
@@ -138,11 +305,11 @@ test("replacing the entire composer and send controls preserves the stable host 
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(footer.querySelector('[data-codex-inline-status]'), host);
   assert.equal(api.discover()[0].key, first.key);
-  assert.equal(api.inspect().bindings[0].labels[0], '≈112 tok/s');
+  assert.equal(api.inspect().bindings[0].labels[0], '112 tok/s');
   document.querySelector('[data-send]').outerHTML = '<button data-send>停止</button>';
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(footer.querySelector('[data-codex-inline-status]'), host);
-  assert.equal(api.inspect().bindings[0].labels[0], '≈112 tok/s');
+  assert.equal(api.inspect().bindings[0].labels[0], '112 tok/s');
   const previousRight = document.querySelector('[data-controls="right"]');
   previousRight.outerHTML = '<div data-controls="right"><button>模型</button><button>麦克风</button><button data-send>发送</button></div>';
   await new Promise(resolve => setImmediate(resolve));
@@ -161,7 +328,7 @@ test("a stable footer gap retains the host, rejects updates, and clears stale va
   document.querySelector('[data-testid="composer"]').remove();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(host.isConnected, true);
-  assert.equal(api.inspect().bindings[0].labels[0], '≈112 tok/s');
+  assert.equal(api.inspect().bindings[0].labels[0], '112 tok/s');
   assert.equal(api.discover()[0].threadId, null);
   assert.equal(api.apply({ key: first.key, metrics: metrics(999) }), false);
   const [timerId, timer] = [...timers.entries()].find(([, value]) => value.delay === 1200);
@@ -169,6 +336,7 @@ test("a stable footer gap retains the host, rejects updates, and clears stale va
   assert.equal(host.isConnected, true);
   assert.equal(api.inspect().bindings[0].labels[0], '— tok/s');
   assert.equal(api.inspect().bindings[0].issue, 'awaiting_composer');
+  for (const [id, animation] of [...timers]) if (animation.delay === 850) { timers.delete(id); animation.callback(); }
   assert.equal(timers.size, 0);
   footer.insertAdjacentHTML('beforeend', stableComposer());
   await new Promise(resolve => setImmediate(resolve));
@@ -261,7 +429,7 @@ test("an externally removed stable host and layout stylesheet are restored witho
   assert.equal(document.querySelector('[data-codex-inline-status]'), host);
   assert.ok(document.querySelector('[data-codex-inline-layout-style]'));
   assert.equal(api.discover()[0].key, first.key);
-  assert.equal(api.inspect().bindings[0].labels[0], '≈112 tok/s');
+  assert.equal(api.inspect().bindings[0].labels[0], '112 tok/s');
 });
 
 test("main and side composers bind independent UUIDs without moving React content", () => {
@@ -272,7 +440,7 @@ test("main and side composers bind independent UUIDs without moving React conten
   assert.equal(bindings.length, 2);
   assert.equal(api.apply({ key: bindings[0].key, metrics: metrics(112) }), true);
   api.apply({ key: bindings[1].key, metrics: metrics(44, .8) });
-  assert.deepEqual(Array.from(api.inspect().bindings, item => Array.from(item.labels)), [["≈112 tok/s", "缓存命中 95.0%"], ["≈44 tok/s", "缓存命中 80.0%"]]);
+  assert.deepEqual(Array.from(api.inspect().bindings, item => Array.from(item.labels)), [["112 tok/s", "缓存命中 95.0%"], ["44 tok/s", "缓存命中 80.0%"]]);
   inputs.forEach((node, i) => assert.equal(document.querySelectorAll("textarea")[i], node));
   buttons.forEach((node, i) => assert.equal(document.querySelectorAll("button")[i], node));
   for (const [index, element] of [...document.querySelectorAll('[data-testid="composer"]')].entries()) {
@@ -335,7 +503,7 @@ test("A to draft to B keeps its external host but clears values, timers, and in-
   const host = element.nextElementSibling;
   const first = api.discover()[0];
   api.apply({ key: first.key, metrics: metrics(112) });
-  assert.equal(timers.size, 1);
+  assert.equal([...timers.values()].filter(timer => timer.delay === 15000).length, 1);
   marker.setAttribute('data-above-composer-conversation-id', '');
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(host.shadowRoot.querySelector('[data-metric="speed"] > span').textContent, "— tok/s");
@@ -358,8 +526,8 @@ test("A to draft to B keeps its external host but clears values, timers, and in-
   assert.equal(api.apply({ key: first.key, metrics: metrics(902) }), false);
   assert.equal(api.apply({ key: draft.key, metrics: metrics(903) }), false);
   assert.equal(api.apply({ key: next.key, metrics: metrics(44) }), true);
-  assert.equal(api.inspect().bindings[0].labels[0], "≈44 tok/s");
-  assert.equal(timers.size, 1);
+  assert.equal(api.inspect().bindings[0].labels[0], "44 tok/s");
+  assert.equal([...timers.values()].filter(timer => timer.delay === 15000).length, 1);
   api.destroy();
   assert.equal(timers.size, 0);
 });
@@ -389,7 +557,7 @@ test("a portal-only Codex draft beside A keeps its own placeholder and unknown s
   assert.deepEqual(Array.from(bindings, binding => binding.threadId), [A, null]);
   api.apply({ key: bindings[0].key, metrics: metrics(112) });
   assert.equal(api.apply({ key: bindings[1].key, metrics: metrics(999) }), false);
-  assert.deepEqual(Array.from(api.inspect().bindings, binding => binding.labels[0]), ["≈112 tok/s", "— tok/s"]);
+  assert.deepEqual(Array.from(api.inspect().bindings, binding => binding.labels[0]), ["112 tok/s", "— tok/s"]);
   const elements = document.querySelectorAll('[data-testid="composer"]');
   assert.equal(elements[1].nextElementSibling.dataset.codexInlineStatus, "1");
   assert.equal(elements[2].nextElementSibling, null);
@@ -441,10 +609,10 @@ test("removing only a composer cleans its external host and retains another conv
   assert.equal(remaining[0].key, second.key);
   assert.equal(remaining[0].threadId, B);
   assert.equal(secondComposer.nextElementSibling, secondHost);
-  assert.equal(api.inspect().bindings[0].labels[0], "≈44 tok/s");
+  assert.equal(api.inspect().bindings[0].labels[0], "44 tok/s");
   assert.equal(api.apply({ key: first.key, metrics: metrics(999) }), false);
   assert.equal(document.querySelectorAll("[data-codex-inline-status]").length, 1);
-  assert.equal(timers.size, 1);
+  assert.equal([...timers.values()].filter(timer => timer.delay === 15000).length, 1);
   api.destroy();
   assert.equal(secondHost.isConnected, false);
   assert.equal(document.querySelectorAll("[data-codex-inline-status]").length, 0);
@@ -459,7 +627,7 @@ test("empty display-none identity markers still bind their own visible composers
   assert.deepEqual(Array.from(bindings, binding => binding.threadId), [A, B]);
   api.apply({ key: bindings[0].key, metrics: metrics(112) });
   api.apply({ key: bindings[1].key, metrics: metrics(44) });
-  assert.deepEqual(Array.from(api.inspect().bindings, binding => binding.labels[0]), ["≈112 tok/s", "≈44 tok/s"]);
+  assert.deepEqual(Array.from(api.inspect().bindings, binding => binding.labels[0]), ["112 tok/s", "44 tok/s"]);
   for (const element of document.querySelectorAll('[data-testid="composer"]')) {
     assert.equal(element.nextElementSibling.dataset.codexInlineStatus, "1");
   }
@@ -526,7 +694,7 @@ test("a nested side composer wins over outer chrome and retains its own thread",
   assert.equal(sideComposer.nextElementSibling.dataset.codexInlineStatus, "1");
   assert.equal(sideComposer.contains(sideComposer.nextElementSibling), false);
   assert.equal(document.querySelector('.composer-surface-chrome').nextElementSibling.dataset.codexInlineStatus, "1");
-  assert.deepEqual(Array.from(api.inspect().bindings, binding => binding.labels[0]), ["≈112 tok/s", "≈44 tok/s"]);
+  assert.deepEqual(Array.from(api.inspect().bindings, binding => binding.labels[0]), ["112 tok/s", "44 tok/s"]);
   dom.window.close();
 });
 
@@ -544,7 +712,7 @@ test("estimated speed states its source and cache uses one decimal without round
   const { dom, document, api } = setup(composer(A));
   const binding = api.discover()[0];
   api.apply({ key: binding.key, metrics: metrics(112, .9826) });
-  assert.deepEqual(Array.from(api.inspect().bindings[0].labels), ["≈112 tok/s", "缓存命中 98.3%"]);
+  assert.deepEqual(Array.from(api.inspect().bindings[0].labels), ["112 tok/s", "缓存命中 98.3%"]);
   const title = document.querySelector("[data-codex-inline-status]").shadowRoot.querySelector('[data-metric="speed"]').title;
   assert.match(title, /整轮有效平均/);
   assert.match(title, /总整轮耗时，包含等待、推理和工具执行/);
@@ -571,7 +739,7 @@ test("source failure is explicit but an excluded latest sample does not invalida
   assert.equal(state.issue, "missing_stream_start");
   assert.equal(state.dataUnavailable, false);
   assert.equal(state.hasMetrics, true);
-  assert.equal(state.labels[0], "≈112 tok/s");
+  assert.equal(state.labels[0], "112 tok/s");
   dom.window.close();
 });
 
@@ -598,18 +766,19 @@ test("one-shot watchdog clears disconnected values, resets on apply, and is remo
   const first = [...timers.keys()][0];
   assert.equal(timers.get(first).delay, 15000);
   api.apply({ key: binding.key, metrics: metrics(120) });
-  assert.equal(timers.size, 1);
+  assert.equal([...timers.values()].filter(timer => timer.delay === 15000).length, 1);
   assert.equal(timers.has(first), false);
-  const [id, timer] = [...timers.entries()][0];
+  const [id, timer] = [...timers.entries()].find(([, timer]) => timer.delay === 15000);
   timers.delete(id); timer.callback();
   const state = api.inspect().bindings[0];
   assert.equal(state.issue, "monitor_disconnected");
   assert.equal(state.dataUnavailable, true);
   assert.equal(state.hasMetrics, false);
   assert.deepEqual(Array.from(state.labels), ["— tok/s", "缓存命中 —"]);
+  for (const [id, animation] of [...timers]) if (animation.delay === 850) { timers.delete(id); animation.callback(); }
   assert.equal(timers.size, 0);
   api.apply({ key: binding.key, metrics: metrics(130) });
-  assert.equal(timers.size, 1);
+  assert.equal([...timers.values()].filter(timer => timer.delay === 15000).length, 1);
   assert.equal(api.inspect().bindings[0].dataUnavailable, false);
   api.destroy();
   assert.equal(timers.size, 0);
@@ -656,7 +825,7 @@ test("destroy removes every host and reinjection remains idempotent", () => {
   const current = dom.window.__CODEX_INLINE_STATUS__;
   assert.equal(current, api);
   assert.equal(current.discover()[0].key, firstKey);
-  assert.equal(current.inspect().bindings[0].labels[0], "≈112 tok/s");
+  assert.equal(current.inspect().bindings[0].labels[0], "112 tok/s");
   assert.equal(current.destroy().removed, 2);
   assert.equal(document.querySelectorAll("[data-codex-inline-status]").length, 0);
   assert.equal(document.querySelectorAll("textarea,button").length, 4);

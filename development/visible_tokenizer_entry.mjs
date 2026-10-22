@@ -1,7 +1,7 @@
 // Fixed local text-tokenization convention. This is not a claim about the
 // tokenizer or billable usage of the upstream model. No network is used.
-import { Tiktoken } from '../tests/native-statusbar-deps/node_modules/js-tiktoken/dist/lite.js';
-import ranks from '../tests/native-statusbar-deps/node_modules/js-tiktoken/dist/ranks/o200k_base.js';
+import { Tiktoken } from 'js-tiktoken/lite';
+import ranks from 'js-tiktoken/ranks/o200k_base';
 
 const encoding = new Tiktoken(ranks);
 export const tokenizerName = 'o200k_base';

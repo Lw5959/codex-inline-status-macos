@@ -1,4 +1,5 @@
-# Local Python/Node environments and caches
+# 开发环境和缓存
+.DS_Store
 __pycache__/
 *.py[cod]
 .venv/
@@ -7,16 +8,28 @@ node_modules/
 .pytest_cache/
 .cache/
 
-# Credentials and personal Codex state
+# 凭据和个人应用状态
 .env
 .env.*
+!.env.example
 auth.json
 credentials*.json
 secrets*.json
 config.toml
 .codex/
+/var/
+/runtime/
+/backups/
+/docs/local/
 
-# Local runtime outputs and release verification artifacts
+# 安装包通过 Releases 分发；本地产物和验收结果不提交源码
+/build/
+/release/
+/outputs/
+*.app/
+*.dmg
+*.zip
+*.pkg
 logs/
 *.log
 *.tmp
@@ -27,4 +40,3 @@ health.json
 VALIDATION*.json
 SHA256SUMS*
 IMPLEMENTATION.md
-*.zip

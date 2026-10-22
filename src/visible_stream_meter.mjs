@@ -3,6 +3,7 @@ export const MAX_VISIBLE_CHARS = 256 * 1024;
 const MAX_ITEMS = 128;
 const MAX_THREADS = 32;
 const MAX_RETIRED_OBSERVERS = 64;
+const LIVE_WINDOW_MS = 5000;
 const STATES = new Set(['collecting', 'provisional', 'completed']);
 
 function validText(text, firstText) {
@@ -78,18 +79,43 @@ function summary(records) {
 function result(thread, extra = {}) {
   const records = thread ? [...thread.records.values()] : [];
   const completed = summary(records.filter(record => record.state === 'completed'));
-  const liveRecord = records.filter(record => record.state === 'provisional'
+  const current = records.filter(record => !thread.activity || record.turnId === thread.activity.turnId);
+  // 短消息常在一次 5 秒采样前就已结束。显示最近一段回复，不能退回跨轮次历史平均，抹平新输出的变化。
+  const latest = records.filter(record => record.state === 'completed').sort((a, b) => b.order - a.order)[0];
+  const confirmed = summary(latest ? [latest] : []);
+  const liveRecord = current.filter(record => (!thread.activity || thread.activity.phase === 'output') && record.state === 'provisional'
     && thread.present.has(record.key) && record.tokens > 0 && record.durationMs > 0)
     .sort((a, b) => b.order - a.order)[0];
-  const live = liveRecord ? summary([liveRecord]) : null;
-  const selected = live ?? completed;
+  let live = liveRecord ? summary([liveRecord]) : null;
+  if (liveRecord?.points?.length >= 2 && Number.isFinite(thread.sampledAtMs)) {
+    // 正文输出中采用最近两次采样之间的 token 增量；无新正文的区间保留有效读数。
+    // 分词仍基于整段正文的 BPE，只对已确认的累计 token 数做差，不独立分词网络块。
+    const [base, current] = liveRecord.points.slice(-2);
+    const tokens = Math.max(0, current.tokens - base.tokens);
+    const seconds = Math.max(0, current.at - base.at) / 1000;
+    if (tokens > 0 && seconds > 0) {
+      live = { tps: tokens / seconds, tokens, seconds, measured_samples: 1 };
+      liveRecord.lastLive = live;
+    } else {
+      // 没有新正文不代表模型速度为 0；保留最近一次有实际 token 增量的有效读数。
+      live = liveRecord.lastLive ?? live;
+    }
+  }
+  const selected = live ?? confirmed;
   return {
     measurement_method: 'visible_stream',
     scope: 'current_observer_recent_visible_items',
-    state: live ? 'provisional' : completed.measured_samples ? 'completed' : 'noData',
+    state: live ? 'provisional' : confirmed.measured_samples ? 'completed' : 'noData',
+    phase: thread?.activity?.phase ?? 'idle',
     ...selected,
     completed,
+    confirmed,
+    confirmed_key: latest?.key ?? null,
+    sample_key: liveRecord?.key ?? latest?.key ?? null,
+    invalidated_keys: records.filter(record => record.state === 'invalid').map(record => record.key),
+    interrupted_keys: records.filter(record => record.state === 'invalid' && record.issue === 'thread_not_active').map(record => record.key),
     live,
+    ...(liveRecord?.points?.length ? { speed_window_ms: LIVE_WINDOW_MS } : {}),
     sample_limit: MAX_ITEMS,
     ...extra,
   };
@@ -131,6 +157,8 @@ export class VisibleStreamMeter {
       thread.present.clear();
       thread.revision = null;
       thread.order = 0;
+      thread.sampledAtMs = null;
+      thread.activity = null;
     }
     this.threads.delete(threadId);
     this.threads.set(threadId, thread);
@@ -140,7 +168,20 @@ export class VisibleStreamMeter {
     if (snapshotRevision !== null && thread.revision !== null && snapshotRevision < thread.revision) {
       return result(thread, { ignored: true, issue: 'stale_snapshot' });
     }
-    thread.present = new Set();
+    if (snapshot.delta === true && (snapshot.baseRevision !== thread.revision || !Array.isArray(snapshot.present))) {
+      return result(null, { issue: 'snapshot_resync_required' });
+    }
+    if (Number.isFinite(snapshot.sampledAtMs) && snapshot.sampledAtMs >= 0) {
+      if (Number.isFinite(thread.sampledAtMs) && snapshot.sampledAtMs < thread.sampledAtMs) {
+        return result(thread, { ignored: true, issue: 'stale_snapshot' });
+      }
+      thread.sampledAtMs = snapshot.sampledAtMs;
+    }
+    const activity = snapshot.activity;
+    thread.activity = id(activity?.turnId) && ['waiting', 'thinking', 'tool', 'output', 'idle'].includes(activity.phase)
+      ? { turnId: activity.turnId, phase: activity.phase } : null;
+    thread.present = new Set(snapshot.delta === true ? snapshot.present.filter(pair => Array.isArray(pair)
+      && id(pair[0]) && id(pair[1])).map(pair => JSON.stringify(pair)) : []);
     for (const item of snapshot.items) {
       if (!item || !id(item.turnId) || !id(item.itemId)
         || (item.threadId !== undefined && item.threadId !== threadId)) continue;
@@ -151,6 +192,15 @@ export class VisibleStreamMeter {
     if (snapshotRevision !== null) thread.revision = snapshotRevision;
     const oldest = [...thread.records.values()].sort((a, b) => a.order - b.order);
     while (thread.records.size > MAX_ITEMS) thread.records.delete(oldest.shift().key);
+    // 即使只有空增量快照，也推进采样时间；否则暂停输出会一直保留上一个区间的速度。
+    for (const record of thread.records.values()) {
+      if (record.state !== 'provisional' || !thread.present.has(record.key) || !record.points
+        || !(record.tokens > 0) || !Number.isFinite(thread.sampledAtMs) || thread.sampledAtMs < record.lastDeltaMs) continue;
+      const point = { at: thread.sampledAtMs, tokens: record.tokens };
+      if (record.points.at(-1)?.at === point.at) record.points[record.points.length - 1] = point;
+      else record.points.push(point);
+      while (record.points.length > 2) record.points.shift();
+    }
     return result(thread);
   }
 
@@ -163,7 +213,8 @@ export class VisibleStreamMeter {
     const invalidate = issue => thread.records.set(key, { key, state: 'invalid', tokens: null,
       durationMs: 0, revision: itemRevision, order: ++thread.order, issue });
     if (item.invalid === true || item.state === 'invalid') {
-      invalidate('observer_invalid');
+      // 离开会话终止后续计量，但不否认离开前已经显示的区间读数；其他失效原因仍撤销历史显示。
+      invalidate(item.issue === 'thread_not_active' ? 'thread_not_active' : 'observer_invalid');
       return;
     }
     if (!STATES.has(item.state) || !validText(item.text, item.firstText)
@@ -177,7 +228,7 @@ export class VisibleStreamMeter {
       invalidate('invalid_reading');
       return;
     }
-    const next = { key, state: item.state, durationMs: item.durationMs, deltaCount: item.deltaCount,
+    const next = { key, turnId: item.turnId, state: item.state, durationMs: item.durationMs, deltaCount: item.deltaCount,
       textLength: item.text.length, textHash: fingerprint(item.text),
       firstLength: item.firstText.length, firstHash: fingerprint(item.firstText), revision: itemRevision };
     if (previous) {
@@ -208,6 +259,13 @@ export class VisibleStreamMeter {
           return;
         }
       }
+    }
+    if (Number.isFinite(item.firstDeltaMs) && Number.isFinite(item.lastDeltaMs)
+      && item.firstDeltaMs >= 0 && item.lastDeltaMs >= item.firstDeltaMs
+      && Math.abs(item.lastDeltaMs - item.firstDeltaMs - item.durationMs) < 0.01) {
+      next.lastDeltaMs = item.lastDeltaMs;
+      next.points = previous?.points ? [...previous.points] : [{ at: item.firstDeltaMs, tokens: 0 }];
+      if (previous?.lastLive) next.lastLive = previous.lastLive;
     }
     next.order = ++thread.order;
     thread.records.set(key, next);

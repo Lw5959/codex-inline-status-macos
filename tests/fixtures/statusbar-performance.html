@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>状态条性能验收 · 模拟对话</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f7f7f8;color:#343434;font:14px -apple-system,BlinkMacSystemFont,sans-serif}
+header{height:64px;padding:20px 28px;background:white;border-bottom:1px solid #e8e8e8}#history{height:calc(100vh - 250px);overflow:auto;padding:20px max(calc((100vw - 800px)/2),30px)}
+article{padding:12px 0;line-height:1.9}[data-thread-scroll-footer]{position:relative;margin:0 auto;width:760px;max-width:90vw;padding:12px 20px 36px;background:#f7f7f8}
+[data-testid=composer]{background:white;border:1px solid #ddd;border-radius:20px;padding:12px;box-shadow:0 3px 10px #00000008}.ComposerLayoutFooter{display:flex;align-items:center;gap:12px}.AdaptiveFooterInput{flex:1}[data-controls=right]{display:flex;justify-content:flex-end}
+textarea{resize:none;width:100%;height:52px;border:0;background:transparent;font:14px -apple-system;outline:0}button{border:0;background:#f4f4f4;border-radius:10px;padding:7px 9px;margin:2px;font-size:12px}#buttons{float:right}#note{color:#888;font-size:12px}
+</style>
+<header>状态条性能验收 <span id="note">模拟数据 · 1000 条历史消息</span><span id="buttons"><button onclick="run()">连续输出</button><button onclick="paused=!paused">暂停 / 恢复</button><button onclick="clearInterval(timer);update(null,'noData',null)">切回 —</button><button onclick="finish()">完成</button></span></header>
+<div id="history"></div>
+<div data-thread-scroll-footer>
+  <div data-above-composer-conversation-id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"></div>
+  <div data-testid="composer"><div class="ComposerLayoutFooter">
+    <div class="AdaptiveFooterInput"><textarea data-codex-thread-reference-drop-target placeholder="输入消息…"></textarea></div>
+    <div data-controls="left"><button>＋</button><button>权限 ▾</button></div>
+    <div data-controls="right"><button>GPT ▾</button><button>🎙</button><button>↑</button></div>
+  </div></div>
+</div>
+<script src="/native_statusbar.js"></script><script src="/visible_stream_observer.js"></script>
+<script>
+// 仅用于长页面中的布局和交互验收；下方数字为模拟值，真实计速另由原生集成测试验收。
+const history=document.querySelector('#history');
+history.innerHTML=Array.from({length:1000},(_,i)=>'<article>第 '+(i+1)+' 条历史记录：这是一段用于滚动和长对话性能验收的模拟正文。</article>').join('');
+history.scrollTop=history.scrollHeight;
+let paused=false,timer=null,n=0;
+function update(tps,state='provisional',cache=.95){
+  const bar=window.__CODEX_INLINE_STATUS__;
+  for(const view of bar.bindings())bar.apply({key:view.key,metrics:{scope:'visible_text_client',measurement_method:'visible_stream',state,tps,cache_hit:cache,measured_samples:1,measured_tokens:tps*2,measured_seconds:2,completed:{tps:110,tokens:220,seconds:2,measured_samples:1}}});
+  watchWidths();
+}
+function run(){clearInterval(timer);paused=false;timer=setInterval(()=>{
+  if(paused)return;
+  n++;const widthCase=new URLSearchParams(location.search).has('width');
+  if(new URLSearchParams(location.search).has('placeholder')&&n%4===3)update(null,'noData',null);
+  else update(widthCase?(n%2?99:100):90+(n%12)*4,'provisional',widthCase?(n%2?.999:1):.95+(n%6)*.004);
+  if(!paused){const p=document.createElement('article');p.textContent='模拟新片段 '+n+'：状态栏数字更新时不应扫描历史消息。';history.append(p);history.scrollTop=history.scrollHeight;}
+},5000)}
+function finish(){clearInterval(timer);update(110,'completed',.972);timer=setInterval(()=>update(110,'completed',.972),5000)}
+// 开发期记录真实 rAF 帧间隔；不进入发布 App，不在每帧读样式或测量布局。
+const frameReports=[];let measuring=false,widthSamples={};
+const widthObserved=new WeakSet();
+const widthObserver=new ResizeObserver(entries=>{if(!measuring)return;for(const e of entries){const metric=e.target.closest('[data-metric]')?.dataset.metric;if(metric)(widthSamples[metric]??=[]).push(e.contentRect.width)}});
+function watchWidths(){for(const h of document.querySelectorAll('[data-codex-inline-status]'))for(const digits of h.shadowRoot.querySelectorAll('.number-switch'))if(!widthObserved.has(digits)){widthObserved.add(digits);widthObserver.observe(digits)}}
+for(const host of document.querySelectorAll('[data-codex-inline-status]'))host.shadowRoot.addEventListener('animationstart',event=>{
+  if(event.animationName!=='codex-number-in'||measuring)return;
+  measuring=true;widthSamples={};const began=performance.now(),gaps=[];let previous=began;
+  function frame(now){gaps.push(now-previous);previous=now;if(now-began<800){requestAnimationFrame(frame);return}
+    const sorted=gaps.slice(1).sort((a,b)=>a-b);const percentile=q=>sorted[Math.min(sorted.length-1,Math.floor(sorted.length*q))]??null;
+    const report={frames:sorted.length,p50:percentile(.5),p95:percentile(.95),max:sorted.at(-1),over32ms:sorted.filter(n=>n>32).length,visibility:document.visibilityState,widthSteps:Object.fromEntries(Object.entries(widthSamples).map(([k,v])=>[k,new Set(v.map(n=>n.toFixed(2))).size]))};
+    frameReports.push(report);while(frameReports.length>12)frameReports.shift();
+    document.querySelector('#note').textContent='模拟数据 · 帧时间 '+JSON.stringify(report);measuring=false;
+  }requestAnimationFrame(frame);
+});
+window.statusbarFrameReports=frameReports;
+if(new URLSearchParams(location.search).has('autoplay'))run();else finish();
+</script>

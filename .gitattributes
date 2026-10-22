@@ -1,2 +1,4 @@
 # Keep the delivered Windows source bytes unchanged on checkout.
 * -text
+# 上游含 CRLF；保留原字节，并让差异检查正确识别 Windows 行尾。
+* whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

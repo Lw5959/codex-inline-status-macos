@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { encode, tokenByteLength } from '../src/visible_tokenizer.mjs';
 import { countVisibleTokens } from '../src/visible_stream_meter.mjs';
-const require = createRequire(new URL('./native-statusbar-deps/package.json', import.meta.url));
+const require = createRequire(import.meta.url);
 const { JSDOM } = require('jsdom');
 const { WebSocketServer } = require('ws');
 const A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -55,14 +55,15 @@ function sample(i, text, durationMs, itemId='sample') {
   emit(i, 'item/agentMessage/delta', { threadId,turnId:turn,itemId,delta:firstText }, 10);
   emit(i, 'item/agentMessage/delta', { threadId,turnId:turn,itemId,delta:text.slice(firstText.length) }, 10+durationMs);
   emit(i, 'item/completed', { threadId,turnId:turn,completedAtMs:Date.now()+2,item:{ id:itemId,type:'agentMessage',text } }, 5000+durationMs);
+  emit(i, 'turn/completed', { threadId, turn: { id: turn } }, 5001+durationMs);
   const tokens = countVisibleTokens(text,firstText,{encode,tokenByteLength});
-  return `≈${Math.round(tokens/(durationMs/1000)).toLocaleString('en-US')} tok/s`;
+  return `${Math.round(tokens/(durationMs/1000)).toLocaleString('en-US')} tok/s`;
 }
 try {
   await waitFor(() => label(0) === '— tok/s');
   const expectedA = sample(0,'Hello world, this is the first observed text.',1000);
   await waitFor(() => label(0) === expectedA);
-  assert.notEqual(label(0),'≈112 tok/s','legacy backend turn speed must never leak into visible speed');
+  assert.notEqual(label(0),'112 tok/s','legacy backend turn speed must never leak into visible speed');
   count = 3;
   await waitFor(() => label(1) === '— tok/s' && label(2) === '— tok/s');
   const expectedB = sample(1,'Hello this is a much longer second text with independently observed timing.',2000);

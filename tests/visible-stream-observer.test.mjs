@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
-const require = createRequire(new URL('./native-statusbar-deps/package.json', import.meta.url));
+const require = createRequire(import.meta.url);
 const { JSDOM } = require('jsdom');
 const source = fs.readFileSync(new URL('../src/visible_stream_observer.js', import.meta.url), 'utf8');
 const A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -104,6 +104,26 @@ test('provisional and completed measurements use first-to-last delta only and re
   assert.deepEqual([item.state, item.text, item.firstText, item.durationMs, item.deltaCount], ['completed', 'hello world!', 'hello', 20, 3]);
   assert.ok(completed.revision > provisional.revision);
   assert.equal(item.revision, completed.revision);
+});
+
+test('turn and item phases follow the current bound conversation without retaining reasoning or tool text', t => {
+  const { api, emit, start, delta, complete, setActive } = setup(t);
+  setActive([A]);
+  emit('turn/started', { threadId: A, turn: { id: turn } });
+  assert.equal(api.snapshot(A).activity.phase, 'waiting');
+  emit('item/started', { threadId: A, turnId: turn, item: { id: 'reason', type: 'reasoning', text: 'private reasoning' } });
+  assert.equal(api.snapshot(A).activity.phase, 'thinking');
+  assert.equal(api.snapshot(A).items.length, 0);
+  start(); delta('a'); delta('b');
+  assert.equal(api.snapshot(A).activity.phase, 'output');
+  complete('ab');
+  emit('item/started', { threadId: A, turnId: turn, item: { id: 'tool', type: 'commandExecution' } });
+  assert.equal(api.snapshot(A).activity.phase, 'tool');
+  emit('turn/started', { threadId: B, turn: { id: uuid(10) } });
+  assert.equal(api.snapshot(B).activity, null);
+  emit('turn/completed', { threadId: A, turn: { id: turn } });
+  assert.equal(api.snapshot(A).activity.phase, 'idle');
+  assert.equal(JSON.stringify(api.snapshot(A)).includes('private reasoning'), false);
 });
 
 test('empty deltas do not count and fewer than two timed batches cannot become a completed sample', t => {
@@ -243,4 +263,38 @@ test('reinjection is idempotent and destroy clears listener, memory, and observe
   const next = dom.window.__CODEX_VISIBLE_STREAM__;
   assert.notEqual(next.snapshot(A).observerId, id);
   assert.equal(next.snapshot(A).items.length, 1);
+});
+
+test('incremental snapshots transmit only changed items while preserving invalidation and identity', t => {
+  const { api, start, delta, complete } = setup(t);
+  start('done'); delta('hello', 'done'); delta(' world', 'done'); complete('hello world', 'done');
+  const full = api.snapshot(A), cursor = { observerId: full.observerId, revision: full.revision };
+  const unchanged = api.snapshot(A, cursor);
+  assert.equal(unchanged.delta, true); assert.equal(unchanged.items.length, 0);
+  assert.equal(unchanged.present.length, 1); assert.equal(unchanged.streaming, false);
+  delta('late', 'done');
+  const revoked = api.snapshot(A, cursor);
+  assert.equal(revoked.items.length, 1); assert.equal(revoked.items[0].state, 'invalid');
+  assert.equal(revoked.items[0].text, '');
+  assert.equal(api.snapshot(A, { ...cursor, observerId: 'old-renderer' }).delta, false);
+  assert.equal(api.snapshot(A, { ...cursor, revision: 999999 }).delta, false);
+});
+
+test('stream notifications coalesce bursts and never carry message bodies', async t => {
+  const { dom, api, start, delta, complete } = setup(t);
+  const notifications = [];
+  const timers = new Map(); let nextTimer = 0;
+  dom.window.setTimeout = (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; };
+  dom.window.clearTimeout = id => timers.delete(id);
+  dom.window.__codexInlineNotify = value => notifications.push(value);
+  start(); for (let i = 0; i < 100; i++) delta('secret');
+  assert.equal(notifications.length, 0);
+  assert.equal(timers.size, 1); assert.equal([...timers.values()][0].delay, 5000);
+  const deliver = () => { const [id, timer] = timers.entries().next().value; timers.delete(id); timer.callback(); };
+  deliver();
+  assert.deepEqual(notifications, ['stream']);
+  complete('secret'.repeat(100));
+  deliver();
+  assert.deepEqual(notifications, ['stream', 'stream']);
+  assert.equal(api.snapshot(A).streaming, false);
 });

@@ -7,7 +7,7 @@ import { PassThrough, Writable } from 'node:stream';
 
 const originalSpawn = childProcess.spawn;
 childProcess.spawn = function (command, args, options) {
-  if (!String(command).endsWith('python.exe') || !args?.some(arg => String(arg).endsWith('native_status_backend.py'))) {
+  if (!args?.some(arg => String(arg).endsWith('native_status_backend.py'))) {
     return originalSpawn(command, args, options);
   }
   const child = new EventEmitter();
